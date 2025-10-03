@@ -170,7 +170,7 @@ function App() {
 
     const rest = frags.filter(f => f.kind !== "init");
     const orderedBuffers = rest.map(f => f.buf!).filter(Boolean);
-    const labels = rest.map(f => f.file.name); // labels for media fragments only
+    const labels = frags.map(f => f.file.name); // labels for media fragments only
 
     mse.enqueueInitAndMedia(init, orderedBuffers, labels);
 

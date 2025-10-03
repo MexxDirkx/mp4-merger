@@ -16,48 +16,74 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { classifyFragment } from "./mp4Probe";
-import { SafeMSE } from "./msePlayer";
-import { extractCodecsFromInit } from "./codecFromInit";
-import { Toasts } from "./Toast";
+import * as MP4Box from "mp4box";
+import { classifyFragment, SafeMSE } from "./mergeMP4";
+import "./App.css";
 
 interface Frag {
   id: string;
   file: File;
   kind: "init" | "media" | "unknown";
   size: number;
-  buf?: ArrayBuffer; // cached
+  buf?: ArrayBuffer;
 }
 
 function SortableItem({ id, file, index }: { id: string; file: File; index: number }) {
+  // Entire row is draggable
   const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id });
   const style = { transform: CSS.Transform.toString(transform), transition };
   return (
-    <div ref={setNodeRef} style={style} className="file-item">
-      <div {...attributes} {...listeners} className="drag-handle">⋮⋮</div>
+    <div ref={setNodeRef} style={style} className="file-item" {...attributes} {...listeners}>
       <span>{index + 1}. {file.name} ({(file.size / 1024 / 1024).toFixed(2)} MB)</span>
     </div>
   );
 }
 
-export default function App() {
+async function extractCodecsFromInit(initSegment: ArrayBuffer): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      const mp4file = MP4Box.createFile();
+      mp4file.onReady = (info: any) => {
+        const codecs: string[] = [];
+        info?.tracks?.forEach((t: any) => { if (t?.codec) codecs.push(t.codec); });
+        resolve(codecs.length ? `video/mp4; codecs="${codecs.join(",")}"` : null);
+      };
+      const buf = initSegment as any;
+      buf.fileStart = 0;
+      mp4file.appendBuffer(buf);
+      mp4file.flush();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function App() {
   const [frags, setFrags] = useState<Frag[]>([]);
   const [error, setError] = useState<string>("");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [toasts, setToasts] = useState<string[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [nowPlaying, setNowPlaying] = useState<string>("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const mseRef = useRef<SafeMSE | null>(null);
+  const downloadUrlRef = useRef<string | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
-  useEffect(() => () => { // cleanup on unmount
-    mseRef.current?.destroy();
+  useEffect(() => {
+    return () => {
+      mseRef.current?.destroy();
+      if (downloadUrlRef.current) {
+        URL.revokeObjectURL(downloadUrlRef.current);
+        downloadUrlRef.current = null;
+      }
+    };
   }, []);
 
   const initFrag = useMemo(() => frags.find(f => f.kind === "init") ?? null, [frags]);
@@ -67,7 +93,6 @@ export default function App() {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
 
-    // Read buffers and classify
     const items: Frag[] = [];
     for (const f of files) {
       const buf = await f.arrayBuffer();
@@ -79,7 +104,7 @@ export default function App() {
     if (unknowns.length) {
       setWarnings(w => [
         ...w,
-        `${unknowns.length} file(s) do not look like MP4 init or media fragments and may be skipped.`,
+        `${unknowns.length} file(s) aren’t recognizable as MP4 init or media fragments and may be skipped.`,
       ]);
     }
     setFrags(items);
@@ -95,25 +120,39 @@ export default function App() {
     });
   }
 
+  function attachTimeUpdate() {
+    const video = videoRef.current!;
+    if (!video) return;
+    const onTU = () => {
+      const t = video.currentTime;
+      const label = mseRef.current?.getLabelForTime(t) ?? "";
+      if (label && label !== nowPlaying) {
+        setNowPlaying(label);
+      }
+    };
+    // Remove previous to avoid duplicates
+    video.removeEventListener("timeupdate", onTU as any);
+    video.addEventListener("timeupdate", onTU);
+  }
+
   async function startPlayback() {
     setToasts([]);
     setWarnings([]);
     setError("");
+    setNowPlaying("");
 
     const video = videoRef.current!;
     if (!video) return;
 
-    // Ensure we have an init segment
     const init = initFrag?.buf ?? null;
     if (!init) {
-      setError("No init segment detected. Include a fragment containing 'ftyp' and 'moov' (the MP4 header).");
+      setError("No init segment detected. Include a fragment that contains MP4 header boxes (ftyp + moov).");
       return;
     }
 
-    // Extract codecs from init with mp4box; fall back if not found
     const mime = (await extractCodecsFromInit(init)) ?? 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
 
-    // Setup MSE
+    // Reset MSE and attach; SafeMSE builds time boundaries for labels
     mseRef.current?.destroy();
     const mse = new SafeMSE(
       video,
@@ -129,39 +168,63 @@ export default function App() {
       return;
     }
 
-    // Build enqueue order: init first, then user-ordered media/unknown
-    const ordered = frags.filter(f => f.kind !== "init").map(f => f.buf!).filter(Boolean);
-    mse.enqueueManyFirstInit(init, ordered);
+    const rest = frags.filter(f => f.kind !== "init");
+    const orderedBuffers = rest.map(f => f.buf!).filter(Boolean);
+    const labels = frags.map(f => f.file.name); // labels for media fragments only
+
+    mse.enqueueInitAndMedia(init, orderedBuffers, labels);
+
+    // Prepare download blob in current order
+    buildDownloadUrl(init, orderedBuffers);
+
+    attachTimeUpdate();
 
     try {
       await video.play();
       setIsPlaying(true);
-    } catch (e) {
-      setError("Autoplay blocked. Press Play to start.");
+    } catch {
+      setError("Autoplay blocked by browser. Press Play in the controls.");
     }
   }
 
   function stopPlayback() {
     mseRef.current?.destroy();
     setIsPlaying(false);
+    setNowPlaying("");
   }
 
-  async function clearList() {
+  function clearAll() {
     stopPlayback();
     setFrags([]);
     setWarnings([]);
     setToasts([]);
     setError("");
+    setNowPlaying("");
     if (fileInputRef.current) fileInputRef.current.value = "";
+    if (downloadUrlRef.current) {
+      URL.revokeObjectURL(downloadUrlRef.current);
+      downloadUrlRef.current = null;
+    }
+  }
+
+  function buildDownloadUrl(init: ArrayBuffer | null, rest: ArrayBuffer[]) {
+    if (downloadUrlRef.current) {
+      URL.revokeObjectURL(downloadUrlRef.current);
+      downloadUrlRef.current = null;
+    }
+    const parts: BlobPart[] = [];
+    if (init) parts.push(new Uint8Array(init));
+    for (const b of rest) parts.push(new Uint8Array(b));
+    const blob = new Blob(parts, { type: "video/mp4" });
+    downloadUrlRef.current = URL.createObjectURL(blob);
   }
 
   return (
     <div className="app">
-      <h1>Byte-Slice MP4 Fragment Player (MSE)</h1>
-
+      <h1>Fragment Player (MSE — plays in your order)</h1>
       <p className="muted">
-        Add byte-sliced MP4 fragments from the <em>same source video</em> (one must contain <code>ftyp+moov</code>).
-        Drag to reorder. Playback will gracefully skip bad/out-of-order fragments.
+        Add byte-sliced fragments from the <em>same source MP4</em>. One fragment must contain <code>ftyp</code>+<code>moov</code> (init).
+        We don’t fix order — playback follows the list order using MSE <code>sequence</code> mode.
       </p>
 
       <div className="row">
@@ -169,14 +232,14 @@ export default function App() {
           ref={fileInputRef}
           type="file"
           multiple
-          accept="video/mp4, .mp4"
+          accept="video/mp4,.mp4"
           onChange={handleFileSelect}
           style={{ display: "none" }}
         />
         <button onClick={() => fileInputRef.current?.click()}>Add Fragments</button>
-        <button className="secondary" onClick={clearList}>Clear</button>
+        <button className="secondary" onClick={clearAll}>Clear</button>
         {!isPlaying ? (
-          <button disabled={!frags.length} className="success" onClick={startPlayback}>Play</button>
+          <button className="success" disabled={!frags.length} onClick={startPlayback}>Play</button>
         ) : (
           <button className="danger" onClick={stopPlayback}>Stop</button>
         )}
@@ -186,32 +249,49 @@ export default function App() {
 
       {frags.length > 0 && (
         <div className="file-list">
-          <h2>Fragments (drag to reorder)</h2>
+          <h2>Fragments (drag to set PLAY order)</h2>
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={frags.map(f => f.id)} strategy={verticalListSortingStrategy}>
-              {frags.map((f, i) => (
-                <SortableItem key={f.id} id={f.id} file={f.file} index={i} />
-              ))}
+              {frags.map((f, i) => <SortableItem key={f.id} id={f.id} file={f.file} index={i} />)}
             </SortableContext>
           </DndContext>
           <div className="legend">
-            <span><b>Detected init:</b> {initFrag ? initFrag.file.name : "none"}</span>
+            <span><b>Init:</b> {initFrag ? initFrag.file.name : "none"}</span>
+            <span style={{ marginLeft: 12 }}><b>Mode:</b> sequence (append order = play order)</span>
           </div>
-        </div>
-      )}
-
-      {warnings.length > 0 && (
-        <div className="warnings">
-          <h3>Warnings</h3>
-          <ul>{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+          {warnings.length > 0 && (
+            <div className="warnings">
+              <h3>Warnings</h3>
+              <ul>{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+            </div>
+          )}
         </div>
       )}
 
       <div className="preview">
+        {isPlaying && nowPlaying && (
+          <div className="now-playing">Now playing: <strong>{nowPlaying}</strong></div>
+        )}
         <video ref={videoRef} controls playsInline preload="metadata" />
+        <div className="download-row">
+          <a
+            className={`download-btn${downloadUrlRef.current ? "" : " disabled"}`}
+            href={downloadUrlRef.current ?? "#"}
+            download="fragments-in-current-order.mp4"
+            onClick={(e) => { if (!downloadUrlRef.current) e.preventDefault(); }}
+          >
+            Download MP4 (current order)
+          </a>
+        </div>
       </div>
 
-      <Toasts messages={toasts} onClear={() => setToasts([])} />
+      {!!toasts.length && (
+        <div className="toasts">
+          {toasts.map((m, i) => <div className="toast" key={i} role="status" aria-live="polite">{m}</div>)}
+        </div>
+      )}
     </div>
   );
 }
+
+export default App;

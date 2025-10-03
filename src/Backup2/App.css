@@ -6,6 +6,7 @@
   --brand: #5b8cff;
   --ok: #1db954;
   --danger: #ff4d4f;
+  --warn: #ffbf40;
   --border: #243047;
 }
 
@@ -15,8 +16,8 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-san
 .app { max-width: 900px; margin: 0 auto; padding: 24px; }
 h1 { margin: 0 0 12px; }
 h2 { margin-top: 24px; }
-.muted { color: var(--muted); margin-top: 0; }
 
+.muted { color: var(--muted); margin-top: 0; }
 .row { display: flex; gap: 8px; align-items: center; margin: 12px 0 16px; }
 
 button {
@@ -43,6 +44,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   padding: 10px; border: 1px dashed var(--border); border-radius: 10px; margin-bottom: 8px; background: #0f1420;
 }
 .drag-handle { cursor: grab; font-size: 22px; user-select: none; color: var(--muted); }
+
 .legend { color: var(--muted); font-size: 14px; margin-top: 8px; }
 
 .warnings {

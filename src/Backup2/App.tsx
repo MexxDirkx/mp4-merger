@@ -16,16 +16,17 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import * as MP4Box from "mp4box"; // as requested
-import { classifyFragment, SafeMSE } from "./mergeMP4";
-import "./App.css";
+import { classifyFragment } from "./mp4Probe";
+import { SafeMSE } from "./msePlayer";
+import { extractCodecsFromInit } from "./codecFromInit";
+import { Toasts } from "./Toast";
 
 interface Frag {
   id: string;
   file: File;
   kind: "init" | "media" | "unknown";
   size: number;
-  buf?: ArrayBuffer;
+  buf?: ArrayBuffer; // cached
 }
 
 function SortableItem({ id, file, index }: { id: string; file: File; index: number }) {
@@ -39,27 +40,7 @@ function SortableItem({ id, file, index }: { id: string; file: File; index: numb
   );
 }
 
-// Parse codec string from init using mp4box; no dynamic import
-async function extractCodecsFromInit(initSegment: ArrayBuffer): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      const mp4file = MP4Box.createFile();
-      mp4file.onReady = (info: any) => {
-        const codecs: string[] = [];
-        info?.tracks?.forEach((t: any) => { if (t?.codec) codecs.push(t.codec); });
-        resolve(codecs.length ? `video/mp4; codecs="${codecs.join(",")}"` : null);
-      };
-      const buf = initSegment as any;
-      buf.fileStart = 0;
-      mp4file.appendBuffer(buf);
-      mp4file.flush();
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-function App() {
+export default function App() {
   const [frags, setFrags] = useState<Frag[]>([]);
   const [error, setError] = useState<string>("");
   const [warnings, setWarnings] = useState<string[]>([]);
@@ -75,8 +56,8 @@ function App() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
-  useEffect(() => {
-    return () => { mseRef.current?.destroy(); };
+  useEffect(() => () => { // cleanup on unmount
+    mseRef.current?.destroy();
   }, []);
 
   const initFrag = useMemo(() => frags.find(f => f.kind === "init") ?? null, [frags]);
@@ -86,6 +67,7 @@ function App() {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
 
+    // Read buffers and classify
     const items: Frag[] = [];
     for (const f of files) {
       const buf = await f.arrayBuffer();
@@ -97,7 +79,7 @@ function App() {
     if (unknowns.length) {
       setWarnings(w => [
         ...w,
-        `${unknowns.length} file(s) aren’t recognizable as MP4 init or media fragments and may be skipped.`,
+        `${unknowns.length} file(s) do not look like MP4 init or media fragments and may be skipped.`,
       ]);
     }
     setFrags(items);
@@ -121,16 +103,17 @@ function App() {
     const video = videoRef.current!;
     if (!video) return;
 
+    // Ensure we have an init segment
     const init = initFrag?.buf ?? null;
     if (!init) {
-      setError("No init segment detected. Include a fragment that contains MP4 header boxes (ftyp + moov).");
+      setError("No init segment detected. Include a fragment containing 'ftyp' and 'moov' (the MP4 header).");
       return;
     }
 
-    // Get codecs from init; if parsing fails, use a safe baseline
+    // Extract codecs from init with mp4box; fall back if not found
     const mime = (await extractCodecsFromInit(init)) ?? 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
 
-    // Reset MSE and attach
+    // Setup MSE
     mseRef.current?.destroy();
     const mse = new SafeMSE(
       video,
@@ -140,22 +123,21 @@ function App() {
     mseRef.current = mse;
 
     try {
-      // IMPORTANT: SafeMSE sets SourceBuffer.mode = "sequence"
       await mse.open(mime);
     } catch (e) {
       setError(`Could not open MSE SourceBuffer (${(e as Error).message}).`);
       return;
     }
 
-    // Enqueue exactly as the user ordered (wrong order is fine). Init always first.
+    // Build enqueue order: init first, then user-ordered media/unknown
     const ordered = frags.filter(f => f.kind !== "init").map(f => f.buf!).filter(Boolean);
     mse.enqueueManyFirstInit(init, ordered);
 
     try {
       await video.play();
       setIsPlaying(true);
-    } catch {
-      setError("Autoplay blocked by browser. Press Play in the controls.");
+    } catch (e) {
+      setError("Autoplay blocked. Press Play to start.");
     }
   }
 
@@ -164,7 +146,7 @@ function App() {
     setIsPlaying(false);
   }
 
-  function clearAll() {
+  async function clearList() {
     stopPlayback();
     setFrags([]);
     setWarnings([]);
@@ -175,10 +157,11 @@ function App() {
 
   return (
     <div className="app">
-      <h1>Fragment Player (MSE — plays in your order)</h1>
+      <h1>Byte-Slice MP4 Fragment Player (MSE)</h1>
+
       <p className="muted">
-        Add byte-sliced fragments from the <em>same source MP4</em>. One fragment must contain <code>ftyp</code>+<code>moov</code> (init).
-        We don’t fix order — playback follows the list order using MSE <code>sequence</code> mode.
+        Add byte-sliced MP4 fragments from the <em>same source video</em> (one must contain <code>ftyp+moov</code>).
+        Drag to reorder. Playback will gracefully skip bad/out-of-order fragments.
       </p>
 
       <div className="row">
@@ -186,14 +169,14 @@ function App() {
           ref={fileInputRef}
           type="file"
           multiple
-          accept="video/mp4,.mp4"
+          accept="video/mp4, .mp4"
           onChange={handleFileSelect}
           style={{ display: "none" }}
         />
         <button onClick={() => fileInputRef.current?.click()}>Add Fragments</button>
-        <button className="secondary" onClick={clearAll}>Clear</button>
+        <button className="secondary" onClick={clearList}>Clear</button>
         {!isPlaying ? (
-          <button className="success" disabled={!frags.length} onClick={startPlayback}>Play</button>
+          <button disabled={!frags.length} className="success" onClick={startPlayback}>Play</button>
         ) : (
           <button className="danger" onClick={stopPlayback}>Stop</button>
         )}
@@ -203,22 +186,24 @@ function App() {
 
       {frags.length > 0 && (
         <div className="file-list">
-          <h2>Fragments (drag to set PLAY order)</h2>
+          <h2>Fragments (drag to reorder)</h2>
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={frags.map(f => f.id)} strategy={verticalListSortingStrategy}>
-              {frags.map((f, i) => <SortableItem key={f.id} id={f.id} file={f.file} index={i} />)}
+              {frags.map((f, i) => (
+                <SortableItem key={f.id} id={f.id} file={f.file} index={i} />
+              ))}
             </SortableContext>
           </DndContext>
           <div className="legend">
-            <span><b>Init:</b> {initFrag ? initFrag.file.name : "none"}</span>
-            <span style={{ marginLeft: 12 }}><b>Mode:</b> sequence (append order = play order)</span>
+            <span><b>Detected init:</b> {initFrag ? initFrag.file.name : "none"}</span>
           </div>
-          {warnings.length > 0 && (
-            <div className="warnings">
-              <h3>Warnings</h3>
-              <ul>{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
-            </div>
-          )}
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="warnings">
+          <h3>Warnings</h3>
+          <ul>{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
         </div>
       )}
 
@@ -226,13 +211,7 @@ function App() {
         <video ref={videoRef} controls playsInline preload="metadata" />
       </div>
 
-      {!!toasts.length && (
-        <div className="toasts">
-          {toasts.map((m, i) => <div className="toast" key={i} role="status" aria-live="polite">{m}</div>)}
-        </div>
-      )}
+      <Toasts messages={toasts} onClear={() => setToasts([])} />
     </div>
   );
 }
-
-export default App;

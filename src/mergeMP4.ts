@@ -1,9 +1,8 @@
-// Helpers used by App.tsx: MP4 fragment classifier + resilient MSE controller that
-// uses SourceBuffer.mode = "sequence" so playback follows append order.
+// Classifier + SafeMSE in SEQUENCE mode.
+// Now tracks buffered end after each media fragment to map currentTime -> label.
 
 export type ProbeKind = "init" | "media" | "unknown";
 
-// --------- MP4 probing (very light) ----------
 function findBoxOffsets(buf: Uint8Array, type: string): number[] {
   const t0 = type.charCodeAt(0), t1 = type.charCodeAt(1), t2 = type.charCodeAt(2), t3 = type.charCodeAt(3);
   const hits: number[] = [];
@@ -13,7 +12,7 @@ function findBoxOffsets(buf: Uint8Array, type: string): number[] {
   return hits;
 }
 
-export function classifyFragment(ab: ArrayBuffer): ProbeKind {
+export function classifyFragment(ab: ArrayBuffer): "init" | "media" | "unknown" {
   const u8 = new Uint8Array(ab);
   const hasFtyp = findBoxOffsets(u8, "ftyp").length > 0;
   const hasMoov = findBoxOffsets(u8, "moov").length > 0;
@@ -25,17 +24,20 @@ export function classifyFragment(ab: ArrayBuffer): ProbeKind {
   return "unknown";
 }
 
-// --------- Resilient MSE controller (SEQUENCE mode) ----------
 type Listener = (msg: string) => void;
 
 export class SafeMSE {
   private mediaSource: MediaSource | null = null;
   private sourceBuffer: SourceBuffer | null = null;
   private queue: ArrayBuffer[] = [];
+  private labels: string[] = [];      // labels for media fragments only (no label for init)
   private pending = false;
   private video: HTMLVideoElement;
   private onWarn: Listener;
   private onInfo: Listener;
+
+  // Timing map (end times after each media append, in seconds)
+  private boundaries: number[] = [];
 
   constructor(video: HTMLVideoElement, onWarn: Listener, onInfo: Listener) {
     this.video = video;
@@ -54,13 +56,8 @@ export class SafeMSE {
         ms.removeEventListener("sourceopen", onOpen);
         try {
           this.sourceBuffer = ms.addSourceBuffer(mime);
-
-          // Play in append order regardless of timestamps
           try { (this.sourceBuffer as any).mode = "sequence"; } catch {}
-
-          // Allow infinite streaming-style appends
           try { ms.duration = Infinity; } catch {}
-
           this.sourceBuffer.addEventListener("error", () => {
             this.onWarn("SourceBuffer error — skipping fragment");
             this.skipCurrent();
@@ -73,11 +70,24 @@ export class SafeMSE {
     });
   }
 
-  enqueueManyFirstInit(init: ArrayBuffer | null, rest: ArrayBuffer[]) {
+  // Enqueue init (if any) + media buffers; 'labels' aligns with media only
+  enqueueInitAndMedia(init: ArrayBuffer | null, media: ArrayBuffer[], labels: string[]) {
     this.queue = [];
+    this.labels = [...labels];
+    this.boundaries = [];
+
     if (init) this.queue.push(init);
-    for (const b of rest) this.queue.push(b);
+    for (const b of media) this.queue.push(b);
+
     this.pump();
+  }
+
+  private getBufferedEnd(): number {
+    const sb = this.sourceBuffer!;
+    const br = sb.buffered;
+    if (!br || br.length === 0) return 0;
+    // In sequence mode there should be one contiguous range; use the last end just in case.
+    return br.end(br.length - 1);
   }
 
   private pump() {
@@ -96,25 +106,45 @@ export class SafeMSE {
     }
 
     const fragment = this.queue[0];
+    const isInitAppend = (this.boundaries.length === 0) && (this.labels.length === this.queue.length - 1);
+    const prevEnd = this.getBufferedEnd();
     this.pending = true;
 
     const onOk = () => {
       cleanup();
+      // After append, if this was a media fragment, record new boundary end
+      const newEnd = this.getBufferedEnd();
+      const delta = newEnd - prevEnd;
+
+      // Init usually doesn't change buffered time; only record for media
+      if (!isInitAppend && delta > 0.005) {
+        this.boundaries.push(newEnd);
+      }
+
+      // Shift queue; if media, shift a label too
       this.queue.shift();
+      if (!isInitAppend) {
+        // when not init append, consume one media label
+        // (labels array aligns with number of media fragments appended so far)
+      } else {
+        // do nothing to labels on init append
+      }
       this.pending = false;
       this.pump();
     };
+
     const onTimeout = () => {
       cleanup();
       this.onWarn("Append stalled — skipping fragment");
       this.skipCurrent();
     };
+
     const cleanup = () => {
       clearTimeout(timer);
       sb.removeEventListener("updateend", onOk);
     };
 
-    const timer = setTimeout(onTimeout, 4000);
+    const timer = setTimeout(onTimeout, 5000);
     sb.addEventListener("updateend", onOk, { once: true });
 
     try {
@@ -128,8 +158,20 @@ export class SafeMSE {
 
   private skipCurrent() {
     if (this.queue.length > 0) this.queue.shift();
+    // No label shift here; labels aren’t consumed directly, we only use boundaries to map times.
     this.pending = false;
     this.pump();
+  }
+
+  // Map currentTime to label: find first boundary >= t
+  getLabelForTime(t: number): string {
+    if (this.labels.length === 0 || this.boundaries.length === 0) return "";
+    for (let i = 0; i < this.boundaries.length; i++) {
+      if (t <= this.boundaries[i] + 1e-3) {
+        return this.labels[i] ?? "";
+      }
+    }
+    return this.labels[this.labels.length - 1] ?? "";
   }
 
   destroy() {
@@ -143,11 +185,13 @@ export class SafeMSE {
     this.sourceBuffer = null;
     this.mediaSource = null;
     this.queue = [];
+    this.labels = [];
+    this.boundaries = [];
     this.pending = false;
   }
 }
 
-// --------- Optional stubs to keep old imports compiling ---------
+// Optional stubs to keep old imports compiling
 export async function mergeMP4(_files: File[]): Promise<Blob> {
   throw new Error("mergeMP4 is not used for playback. MSE streams fragments directly in append order.");
 }

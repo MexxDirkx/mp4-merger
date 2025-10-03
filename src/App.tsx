@@ -16,7 +16,7 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import * as MP4Box from "mp4box"; // as requested
+import * as MP4Box from "mp4box";
 import { classifyFragment, SafeMSE } from "./mergeMP4";
 import "./App.css";
 
@@ -29,17 +29,16 @@ interface Frag {
 }
 
 function SortableItem({ id, file, index }: { id: string; file: File; index: number }) {
+  // Entire row is draggable
   const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id });
   const style = { transform: CSS.Transform.toString(transform), transition };
   return (
-    <div ref={setNodeRef} style={style} className="file-item">
-      <div {...attributes} {...listeners} className="drag-handle">⋮⋮</div>
+    <div ref={setNodeRef} style={style} className="file-item" {...attributes} {...listeners}>
       <span>{index + 1}. {file.name} ({(file.size / 1024 / 1024).toFixed(2)} MB)</span>
     </div>
   );
 }
 
-// Parse codec string from init using mp4box; no dynamic import
 async function extractCodecsFromInit(initSegment: ArrayBuffer): Promise<string | null> {
   return new Promise((resolve) => {
     try {
@@ -65,10 +64,12 @@ function App() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [toasts, setToasts] = useState<string[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [nowPlaying, setNowPlaying] = useState<string>("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const mseRef = useRef<SafeMSE | null>(null);
+  const downloadUrlRef = useRef<string | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -76,7 +77,13 @@ function App() {
   );
 
   useEffect(() => {
-    return () => { mseRef.current?.destroy(); };
+    return () => {
+      mseRef.current?.destroy();
+      if (downloadUrlRef.current) {
+        URL.revokeObjectURL(downloadUrlRef.current);
+        downloadUrlRef.current = null;
+      }
+    };
   }, []);
 
   const initFrag = useMemo(() => frags.find(f => f.kind === "init") ?? null, [frags]);
@@ -113,10 +120,26 @@ function App() {
     });
   }
 
+  function attachTimeUpdate() {
+    const video = videoRef.current!;
+    if (!video) return;
+    const onTU = () => {
+      const t = video.currentTime;
+      const label = mseRef.current?.getLabelForTime(t) ?? "";
+      if (label && label !== nowPlaying) {
+        setNowPlaying(label);
+      }
+    };
+    // Remove previous to avoid duplicates
+    video.removeEventListener("timeupdate", onTU as any);
+    video.addEventListener("timeupdate", onTU);
+  }
+
   async function startPlayback() {
     setToasts([]);
     setWarnings([]);
     setError("");
+    setNowPlaying("");
 
     const video = videoRef.current!;
     if (!video) return;
@@ -127,10 +150,9 @@ function App() {
       return;
     }
 
-    // Get codecs from init; if parsing fails, use a safe baseline
     const mime = (await extractCodecsFromInit(init)) ?? 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
 
-    // Reset MSE and attach
+    // Reset MSE and attach; SafeMSE builds time boundaries for labels
     mseRef.current?.destroy();
     const mse = new SafeMSE(
       video,
@@ -140,16 +162,22 @@ function App() {
     mseRef.current = mse;
 
     try {
-      // IMPORTANT: SafeMSE sets SourceBuffer.mode = "sequence"
       await mse.open(mime);
     } catch (e) {
       setError(`Could not open MSE SourceBuffer (${(e as Error).message}).`);
       return;
     }
 
-    // Enqueue exactly as the user ordered (wrong order is fine). Init always first.
-    const ordered = frags.filter(f => f.kind !== "init").map(f => f.buf!).filter(Boolean);
-    mse.enqueueManyFirstInit(init, ordered);
+    const rest = frags.filter(f => f.kind !== "init");
+    const orderedBuffers = rest.map(f => f.buf!).filter(Boolean);
+    const labels = rest.map(f => f.file.name); // labels for media fragments only
+
+    mse.enqueueInitAndMedia(init, orderedBuffers, labels);
+
+    // Prepare download blob in current order
+    buildDownloadUrl(init, orderedBuffers);
+
+    attachTimeUpdate();
 
     try {
       await video.play();
@@ -162,6 +190,7 @@ function App() {
   function stopPlayback() {
     mseRef.current?.destroy();
     setIsPlaying(false);
+    setNowPlaying("");
   }
 
   function clearAll() {
@@ -170,7 +199,24 @@ function App() {
     setWarnings([]);
     setToasts([]);
     setError("");
+    setNowPlaying("");
     if (fileInputRef.current) fileInputRef.current.value = "";
+    if (downloadUrlRef.current) {
+      URL.revokeObjectURL(downloadUrlRef.current);
+      downloadUrlRef.current = null;
+    }
+  }
+
+  function buildDownloadUrl(init: ArrayBuffer | null, rest: ArrayBuffer[]) {
+    if (downloadUrlRef.current) {
+      URL.revokeObjectURL(downloadUrlRef.current);
+      downloadUrlRef.current = null;
+    }
+    const parts: BlobPart[] = [];
+    if (init) parts.push(new Uint8Array(init));
+    for (const b of rest) parts.push(new Uint8Array(b));
+    const blob = new Blob(parts, { type: "video/mp4" });
+    downloadUrlRef.current = URL.createObjectURL(blob);
   }
 
   return (
@@ -223,7 +269,20 @@ function App() {
       )}
 
       <div className="preview">
+        {isPlaying && nowPlaying && (
+          <div className="now-playing">Now playing: <strong>{nowPlaying}</strong></div>
+        )}
         <video ref={videoRef} controls playsInline preload="metadata" />
+        <div className="download-row">
+          <a
+            className={`download-btn${downloadUrlRef.current ? "" : " disabled"}`}
+            href={downloadUrlRef.current ?? "#"}
+            download="fragments-in-current-order.mp4"
+            onClick={(e) => { if (!downloadUrlRef.current) e.preventDefault(); }}
+          >
+            Download MP4 (current order)
+          </a>
+        </div>
       </div>
 
       {!!toasts.length && (

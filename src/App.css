@@ -41,17 +41,41 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .file-item {
   display: flex; align-items: center; gap: 10px;
   padding: 10px; border: 1px dashed var(--border); border-radius: 10px; margin-bottom: 8px; background: #0f1420;
+  cursor: grab;
 }
-.drag-handle { cursor: grab; font-size: 22px; user-select: none; color: var(--muted); }
+.file-item:active { cursor: grabbing; }
+
 .legend { color: var(--muted); font-size: 14px; margin-top: 8px; }
 
 .warnings {
-  background: #1f1a0a; border: 1px solid #5c4a1c; padding: 10px 12px; border-radius: 8px; margin-top: 12px;
+  background: #1f1a0a; border: 1px solid #5c4a2c; padding: 10px 12px; border-radius: 8px; margin-top: 12px;
 }
 .warnings h3 { margin: 0 0 8px; }
 
 .preview { margin-top: 20px; }
+
+.now-playing {
+  margin: 0 0 6px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
 .preview video { width: 100%; max-height: 420px; background: #000; border-radius: 12px; border: 1px solid var(--border); }
+
+.download-row { margin-top: 10px; }
+.download-btn {
+  display: inline-block;
+  text-decoration: none;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: #1c2333;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.download-btn.disabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
 
 /* Toasts */
 .toasts {

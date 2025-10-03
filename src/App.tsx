@@ -17,7 +17,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import * as MP4Box from "mp4box";
-import { classifyFragment, SafeMSE } from "./mergeMP4";
+import { classifyFragment, SafeMSE, probeOrderKey } from "./mergeMP4";
 import "./App.css";
 
 interface Frag {
@@ -71,6 +71,9 @@ function App() {
   const mseRef = useRef<SafeMSE | null>(null);
   const downloadUrlRef = useRef<string | null>(null);
 
+  const [autoMode, setAutoMode] = useState(false);
+  const prevFragsRef = useRef<Frag[] | null>(null);
+
   const sensors = useSensors(
     useSensor(PointerSensor),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -108,6 +111,8 @@ function App() {
       ]);
     }
     setFrags(items);
+    setAutoMode(false);
+    prevFragsRef.current = null;
   }
 
   function handleDragEnd(event: DragEndEvent) {
@@ -219,6 +224,41 @@ function App() {
     downloadUrlRef.current = URL.createObjectURL(blob);
   }
 
+  function autoOrder(fragsIn: Frag[]): Frag[] {
+    // Keep first init (if any) at the top; sort media by tfdt then mfhd
+    const init = fragsIn.find(f => f.kind === "init") || null;
+    const media = fragsIn.filter(f => f.kind !== "init");
+
+    const scored = media.map(f => {
+      const { dts, seq } = probeOrderKey(f.buf!);
+      return { frag: f, dts: dts ?? Number.POSITIVE_INFINITY, seq: seq ?? Number.POSITIVE_INFINITY };
+    });
+
+    scored.sort((a, b) => {
+      if (a.dts !== b.dts) return a.dts - b.dts;
+      if (a.seq !== b.seq) return a.seq - b.seq;
+      return a.frag.file.name.localeCompare(b.frag.file.name);
+    });
+
+    const sorted = scored.map(s => s.frag);
+    return init ? [init, ...sorted] : sorted;
+  }
+
+  function toggleAutoMode() {
+    if (!autoMode) {
+      // Save current order so we can restore
+      prevFragsRef.current = frags.slice();
+      setFrags(autoOrder(frags));
+      setAutoMode(true);
+    } else {
+      // Restore previous manual order
+      if (prevFragsRef.current) setFrags(prevFragsRef.current);
+      prevFragsRef.current = null;
+      setAutoMode(false);
+    }
+  }
+
+
   return (
     <div className="app">
       <h1>Fragment Player (MSE — plays in your order)</h1>
@@ -243,6 +283,17 @@ function App() {
         ) : (
           <button className="danger" onClick={stopPlayback}>Stop</button>
         )}
+
+        <button
+          className={autoMode ? "secondary" : "secondary"}
+          onClick={toggleAutoMode}
+          disabled={!frags.length}
+          title="Try to sort fragments using mp4 timing/sequence hints"
+        >
+          {autoMode ? "Manual Order" : "Auto-Order (beta)"}
+        </button>
+
+
       </div>
 
       {error && <div className="error">{error}</div>}

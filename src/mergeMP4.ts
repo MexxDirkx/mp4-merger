@@ -203,3 +203,44 @@ export async function checkFormatCompatibility(files: File[]): Promise<string[]>
   }
   return warns;
 }
+
+
+// Reads ordering hints from a fragmented MP4 media fragment.
+// Returns either a decode-time (tfdt) and/or a sequence number (mfhd).
+export function probeOrderKey(ab: ArrayBuffer): { seq?: number; dts?: number } {
+  try {
+    const u8 = new Uint8Array(ab);
+    const dv = new DataView(ab);
+
+    // --- mfhd (sequence number) ---
+    const mfhdHits = findBoxOffsets(u8, "mfhd");
+    let seq: number | undefined = undefined;
+    if (mfhdHits.length) {
+      const off = mfhdHits[0];
+      // size(4) + type(4) + version/flags(4) + sequence_number(4)
+      seq = dv.getUint32(off + 8 + 4, false);
+    }
+
+    // --- tfdt (baseMediaDecodeTime) ---
+    const tfdtHits = findBoxOffsets(u8, "tfdt");
+    let dts: number | undefined = undefined;
+    if (tfdtHits.length) {
+      const off = tfdtHits[0];
+      const version = dv.getUint8(off + 8); // version/flags
+      if (version === 1) {
+        // 64-bit base decode time
+        const hi = dv.getUint32(off + 12, false);
+        const lo = dv.getUint32(off + 16, false);
+        const big = (BigInt(hi) << BigInt(32)) | BigInt(lo);
+        const maybe = Number(big);
+        dts = Number.isFinite(maybe) ? maybe : undefined;
+      } else {
+        dts = dv.getUint32(off + 12, false);
+      }
+    }
+
+    return { seq, dts };
+  } catch {
+    return {};
+  }
+}
